@@ -33,20 +33,26 @@ class RtspClient(
     private var videoPayloadType: Int = -1
     private var audioPayloadType: Int = -1
 
-    // RTP 포트 정보
-    private val clientRtpPort = 5004  // 클라이언트 RTP 포트
-    private val clientRtcpPort = 5005 // 클라이언트 RTCP 포트
-    private var serverRtpPort = -1    // 서버 RTP 포트
-    private var serverRtcpPort = -1   // 서버 RTCP 포트
+    // RTP 포트 정보 - 여러 포트로 시도
+    private val clientRtpPorts = listOf(6000, 7000, 8000, 5004)
+    private var selectedRtpPort = -1
+    private var selectedRtcpPort = -1
+    private var serverRtpPort = -1
+    private var serverRtcpPort = -1
+
+    // TCP Interleaved 모드 지원
+    private var useTcpInterleaved = false
+    private var interleavedChannel = 0
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     interface RTSPClientListener {
         fun onConnected()
-        fun onSetupComplete(rtpPort: Int, rtcpPort: Int)
+        fun onSetupComplete(rtpPort: Int, rtcpPort: Int, isTcp: Boolean)
         fun onPlayStarted()
         fun onError(error: String)
         fun onSdpReceived(sdp: String)
+        fun onRtpDataReceived(data: ByteArray, isRtp: Boolean) // TCP Interleaved용
     }
 
     init {
@@ -60,10 +66,9 @@ class RtspClient(
     fun connect() {
         scope.launch {
             try {
-                // RTSP 소켓 연결
                 rtspSocket = Socket().apply {
-                    soTimeout = 10000 // 10초 타임아웃 (범용적으로 안전한 값)
-                    connect(InetSocketAddress(serverHost, serverPort), 15000) // 연결 타임아웃 15초
+                    soTimeout = 10000
+                    connect(InetSocketAddress(serverHost, serverPort), 15000)
                     tcpNoDelay = true
                     keepAlive = true
                 }
@@ -77,7 +82,6 @@ class RtspClient(
                     listener?.onConnected()
                 }
 
-                // RTSP 프로토콜 시작
                 sendOptions()
 
             } catch (e: Exception) {
@@ -136,7 +140,7 @@ class RtspClient(
             writer?.print(request)
             writer?.flush()
 
-            delay(100) // 서버 처리 시간 확보
+            delay(100)
 
             val response = readResponse()
             Log.d(TAG, "DESCRIBE Response:\n$response")
@@ -145,11 +149,16 @@ class RtspClient(
                 val sdp = extractSdp(response)
                 if (sdp.isNotEmpty()) {
                     parseSdp(sdp)
-                    parseContentBase(response) // Content-Base 파싱
+                    parseContentBase(response)
                     withContext(Dispatchers.Main) {
                         listener?.onSdpReceived(sdp)
                     }
-                    sendSetup()
+
+                    // TCP Interleaved 먼저 시도
+                    if (!tryTcpInterleavedSetup()) {
+                        // TCP 실패 시 UDP 시도
+                        tryUdpSetup()
+                    }
                 } else {
                     withContext(Dispatchers.Main) {
                         listener?.onError("Empty SDP received")
@@ -168,19 +177,13 @@ class RtspClient(
         }
     }
 
-    private suspend fun sendSetup() {
+    private suspend fun tryTcpInterleavedSetup(): Boolean {
         try {
-            val track = videoTrack
-            if (track == null) {
-                withContext(Dispatchers.Main) {
-                    listener?.onError("No video track found")
-                }
-                return
-            }
+            val track = videoTrack ?: return false
 
             val currentCseq = cseq.getAndIncrement()
             val setupUrl = buildSetupUrl(track)
-            val transport = "RTP/AVP;unicast;client_port=$clientRtpPort-$clientRtcpPort"
+            val transport = "RTP/AVP/TCP;unicast;interleaved=0-1"
 
             val request = buildString {
                 append("SETUP $setupUrl $RTSP_VERSION\r\n")
@@ -190,30 +193,121 @@ class RtspClient(
                 append("\r\n")
             }
 
-            Log.d(TAG, "Sending SETUP:\n$request")
+            Log.d(TAG, "Trying TCP Interleaved SETUP:\n$request")
             writer?.print(request)
             writer?.flush()
 
             val response = readResponse()
-            Log.d(TAG, "SETUP Response:\n$response")
+            Log.d(TAG, "TCP SETUP Response:\n$response")
 
-            if (response.contains("200 OK")) {
+            if (response.contains("200 OK") && response.contains("interleaved")) {
+                Log.d(TAG, "TCP Interleaved mode successful!")
+                useTcpInterleaved = true
                 parseSetupResponse(response)
+
                 withContext(Dispatchers.Main) {
-                    listener?.onSetupComplete(clientRtpPort, clientRtcpPort)
+                    listener?.onSetupComplete(-1, -1, true)
                 }
+
                 sendPlay()
-            } else {
-                withContext(Dispatchers.Main) {
-                    listener?.onError("SETUP failed - Response: $response")
-                }
+                return true
             }
+
+            return false
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to send SETUP", e)
-            withContext(Dispatchers.Main) {
-                listener?.onError("SETUP failed: ${e.message}")
+            Log.w(TAG, "TCP Interleaved setup failed: ${e.message}")
+            return false
+        }
+    }
+
+    private suspend fun tryUdpSetup(): Boolean {
+        // 여러 포트로 시도
+        for (basePort in clientRtpPorts) {
+            try {
+                if (tryUdpSetupWithPort(basePort, basePort + 1)) {
+                    return true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "UDP setup failed with port $basePort: ${e.message}")
             }
         }
+
+        // 모든 포트 실패 시 자동 할당 시도
+        return tryUdpSetupWithPort(0, 0)
+    }
+
+    private suspend fun tryUdpSetupWithPort(rtpPort: Int, rtcpPort: Int): Boolean {
+        try {
+            val track = videoTrack ?: return false
+
+            // 포트 사용 가능 여부 확인
+            if (rtpPort > 0) {
+                val testSocket = DatagramSocket(rtpPort)
+                testSocket.close()
+                Log.d(TAG, "Port $rtpPort is available")
+            }
+
+            val currentCseq = cseq.getAndIncrement()
+            val setupUrl = buildSetupUrl(track)
+            val transport = if (rtpPort == 0) {
+                "RTP/AVP;unicast" // 서버가 포트 할당
+            } else {
+                "RTP/AVP;unicast;client_port=$rtpPort-$rtcpPort"
+            }
+
+            val request = buildString {
+                append("SETUP $setupUrl $RTSP_VERSION\r\n")
+                append("CSeq: $currentCseq\r\n")
+                append("Transport: $transport\r\n")
+                append("User-Agent: Universal-RTSP-Client/1.0\r\n")
+                append("\r\n")
+            }
+
+            Log.d(TAG, "Trying UDP SETUP with port $rtpPort:\n$request")
+            writer?.print(request)
+            writer?.flush()
+
+            val response = readResponse()
+            Log.d(TAG, "UDP SETUP Response:\n$response")
+
+            if (response.contains("200 OK")) {
+                useTcpInterleaved = false
+                parseSetupResponse(response)
+
+                selectedRtpPort = if (rtpPort == 0) extractClientPortFromResponse(response) else rtpPort
+                selectedRtcpPort = selectedRtpPort + 1
+
+                Log.d(TAG, "UDP mode successful! Using ports: $selectedRtpPort-$selectedRtcpPort")
+
+                withContext(Dispatchers.Main) {
+                    listener?.onSetupComplete(selectedRtpPort, selectedRtcpPort, false)
+                }
+
+                sendPlay()
+                return true
+            }
+
+            return false
+        } catch (e: Exception) {
+            Log.w(TAG, "UDP setup failed with port $rtpPort: ${e.message}")
+            return false
+        }
+    }
+
+    private fun extractClientPortFromResponse(response: String): Int {
+        // Transport 라인에서 실제 할당된 클라이언트 포트 추출
+        val lines = response.split("\r\n")
+        for (line in lines) {
+            if (line.lowercase().startsWith("transport:")) {
+                val transport = line.substring(10).trim()
+                if (transport.contains("client_port=")) {
+                    val clientPorts = transport.split("client_port=")[1].split(";")[0]
+                    val ports = clientPorts.split("-")
+                    return ports[0].toIntOrNull() ?: selectedRtpPort
+                }
+            }
+        }
+        return selectedRtpPort
     }
 
     private suspend fun sendPlay() {
@@ -248,11 +342,19 @@ class RtspClient(
                     withContext(Dispatchers.Main) {
                         listener?.onPlayStarted()
                     }
+
+                    // TCP Interleaved 모드일 때 RTP 데이터 수신 시작
+                    if (useTcpInterleaved) {
+                        startTcpInterleavedReceiving()
+                    }
                 } else if (response.trim().isEmpty()) {
-                    // 일부 서버는 PLAY 응답을 보내지 않음
                     Log.w(TAG, "Empty PLAY response - assuming streaming started")
                     withContext(Dispatchers.Main) {
                         listener?.onPlayStarted()
+                    }
+
+                    if (useTcpInterleaved) {
+                        startTcpInterleavedReceiving()
                     }
                 } else {
                     withContext(Dispatchers.Main) {
@@ -260,16 +362,87 @@ class RtspClient(
                     }
                 }
             } catch (e: java.net.SocketTimeoutException) {
-                // 일부 서버는 PLAY 응답을 보내지 않고 바로 스트리밍 시작
                 Log.w(TAG, "PLAY response timeout - assuming streaming started")
                 withContext(Dispatchers.Main) {
                     listener?.onPlayStarted()
+                }
+
+                if (useTcpInterleaved) {
+                    startTcpInterleavedReceiving()
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send PLAY", e)
             withContext(Dispatchers.Main) {
                 listener?.onError("PLAY failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun startTcpInterleavedReceiving() {
+        scope.launch {
+            try {
+                Log.d(TAG, "Starting TCP Interleaved RTP receiving...")
+                val inputStream = rtspSocket?.inputStream ?: return@launch
+                val buffer = ByteArray(65536)
+
+                while (isActive) {
+                    try {
+                        // Interleaved frame 헤더 읽기: $ + channel + length(2bytes)
+                        val header = ByteArray(4)
+                        var bytesRead = 0
+                        while (bytesRead < 4) {
+                            val read = inputStream.read(header, bytesRead, 4 - bytesRead)
+                            if (read == -1) break
+                            bytesRead += read
+                        }
+
+                        if (bytesRead == 4 && header[0] == '$'.code.toByte()) {
+                            val channel = header[1].toInt() and 0xFF
+                            val length = ((header[2].toInt() and 0xFF) shl 8) or (header[3].toInt() and 0xFF)
+
+                            Log.d(TAG, "TCP Interleaved frame: channel=$channel, length=$length")
+
+                            if (length > 0 && length < buffer.size) {
+                                // RTP/RTCP 데이터 읽기
+                                bytesRead = 0
+                                while (bytesRead < length) {
+                                    val read = inputStream.read(buffer, bytesRead, length - bytesRead)
+                                    if (read == -1) break
+                                    bytesRead += read
+                                }
+
+                                if (bytesRead == length) {
+                                    val data = ByteArray(length)
+                                    System.arraycopy(buffer, 0, data, 0, length)
+
+                                    // RTP 데이터 처리
+                                    if (channel == 0) { // RTP channel
+                                        Log.d(TAG, "TCP RTP data received: $length bytes")
+                                        withContext(Dispatchers.Main) {
+                                            listener?.onRtpDataReceived(data, true)
+                                        }
+                                    } else if (channel == 1) { // RTCP channel
+                                        Log.d(TAG, "TCP RTCP data received: $length bytes")
+                                        withContext(Dispatchers.Main) {
+                                            listener?.onRtpDataReceived(data, false)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: java.net.SocketTimeoutException) {
+                        // 정상적인 타임아웃
+                        continue
+                    } catch (e: Exception) {
+                        if (isActive) {
+                            Log.e(TAG, "Error in TCP Interleaved receiving", e)
+                            delay(100)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "TCP Interleaved receiving failed", e)
             }
         }
     }
@@ -281,7 +454,6 @@ class RtspClient(
         try {
             Log.d(TAG, "Starting to read response...")
 
-            // 헤더 읽기
             var lineCount = 0
             while (true) {
                 try {
@@ -305,7 +477,7 @@ class RtspClient(
                         break
                     }
 
-                    if (lineCount > 50) { // 비정상적으로 긴 헤더 방지
+                    if (lineCount > 50) {
                         Log.w(TAG, "Too many header lines, breaking")
                         break
                     }
@@ -321,7 +493,6 @@ class RtspClient(
                 }
             }
 
-            // 본문 읽기 (SDP 등)
             if (contentLength > 0) {
                 Log.d(TAG, "Reading content body of $contentLength bytes")
                 val buffer = CharArray(contentLength)
@@ -337,7 +508,6 @@ class RtspClient(
                         }
                         totalRead += read
 
-                        // 본문 읽기 타임아웃 (10초)
                         if (System.currentTimeMillis() - startTime > 10000) {
                             Log.w(TAG, "Content read timeout after $totalRead bytes")
                             break
@@ -357,7 +527,6 @@ class RtspClient(
         } catch (e: Exception) {
             Log.e(TAG, "Error reading response", e)
 
-            // 부분적인 응답이라도 있다면 반환
             if (response.isNotEmpty()) {
                 Log.w(TAG, "Returning partial response due to error")
                 return@withContext response.toString()
@@ -447,17 +616,15 @@ class RtspClient(
             }
         }
 
-        // 결과 요약
         Log.d(TAG, "SDP Parsing Result:")
         Log.d(TAG, "  Video track: $videoTrack")
         Log.d(TAG, "  Audio track: $audioTrack")
         Log.d(TAG, "  Video payload type: $videoPayloadType")
         Log.d(TAG, "  Audio payload type: $audioPayloadType")
 
-        // 비디오 트랙이 없으면 기본값들 시도
         if (videoTrack == null) {
             Log.w(TAG, "No video track found, trying common defaults")
-            videoTrack = "*" // 많은 서버에서 사용하는 기본값
+            videoTrack = "*"
             Log.d(TAG, "Using default video track: $videoTrack")
         }
     }
@@ -466,24 +633,20 @@ class RtspClient(
         Log.d(TAG, "Building SETUP URL for track: '$track'")
 
         val setupUrl = when {
-            // 절대 URL (full RTSP URL)
             track.startsWith("rtsp://") -> {
                 Log.d(TAG, "Track is absolute URL")
                 track
             }
-            // 상대 경로 (/)로 시작
             track.startsWith("/") -> {
                 val base = contentBase ?: "rtsp://$serverHost:$serverPort"
                 val url = base.trimEnd('/') + track
                 Log.d(TAG, "Track is absolute path, using base: $url")
                 url
             }
-            // 와일드카드 (*)
             track == "*" -> {
                 Log.d(TAG, "Track is wildcard, using main URL")
                 rtspUrl
             }
-            // 상대 경로
             else -> {
                 val base = contentBase ?: rtspUrl
                 val url = base.trimEnd('/') + "/" + track
@@ -503,7 +666,6 @@ class RtspClient(
             when {
                 line.lowercase().startsWith("session:") -> {
                     val session = line.substring(8).trim()
-                    // 세션 ID에서 타임아웃 부분 제거
                     sessionId = if (session.contains(";")) {
                         session.split(";")[0]
                     } else {
@@ -512,8 +674,17 @@ class RtspClient(
                     Log.d(TAG, "Session ID: $sessionId")
                 }
                 line.lowercase().startsWith("transport:") -> {
-                    // 서버 RTP 포트 파싱
                     val transport = line.substring(10).trim()
+
+                    // Interleaved 모드 확인
+                    if (transport.contains("interleaved=")) {
+                        val interleavedStr = transport.split("interleaved=")[1].split(";")[0]
+                        val channels = interleavedStr.split("-")
+                        interleavedChannel = channels[0].toIntOrNull() ?: 0
+                        Log.d(TAG, "TCP Interleaved channel: $interleavedChannel")
+                    }
+
+                    // 서버 포트 파싱
                     if (transport.contains("server_port=")) {
                         try {
                             val serverPorts = transport.split("server_port=")[1].split(";")[0]
@@ -579,11 +750,12 @@ class RtspClient(
     }
 
     // Getter 프로퍼티들
-    val getClientRtpPort: Int get() = clientRtpPort
-    val getClientRtcpPort: Int get() = clientRtcpPort
+    val getClientRtpPort: Int get() = selectedRtpPort
+    val getClientRtcpPort: Int get() = selectedRtcpPort
     val getServerRtpPort: Int get() = serverRtpPort
     val getServerRtcpPort: Int get() = serverRtcpPort
     val getVideoPayloadType: Int get() = videoPayloadType
     val getSessionId: String? get() = sessionId
     val getVideoTrack: String? get() = videoTrack
+    val isUsingTcpInterleaved: Boolean get() = useTcpInterleaved
 }
