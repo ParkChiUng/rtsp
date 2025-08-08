@@ -379,6 +379,16 @@ class RtspClient(
         }
     }
 
+    /**
+     * TCP로 RTP를 수신 받으면
+     *
+     * TCP : [TCP Stream][$][Channel][Length][RTP Header][H.264 Payload]
+     *
+     * 이런 형식인데, [RTP Header][H.264 Payload] 이렇게 추출해서
+     *
+     * RTP 패킷만 넘긴다.
+     *
+     * **/
     private fun startTcpInterleavedReceiving() {
         scope.launch {
             try {
@@ -401,7 +411,7 @@ class RtspClient(
                             val channel = header[1].toInt() and 0xFF
                             val length = ((header[2].toInt() and 0xFF) shl 8) or (header[3].toInt() and 0xFF)
 
-                            Log.d(TAG, "TCP Interleaved frame: channel=$channel, length=$length")
+//                            Log.d(TAG, "TCP Interleaved frame: channel=$channel, length=$length")
 
                             if (length > 0 && length < buffer.size) {
                                 // RTP/RTCP 데이터 읽기
@@ -418,12 +428,12 @@ class RtspClient(
 
                                     // RTP 데이터 처리
                                     if (channel == 0) { // RTP channel
-                                        Log.d(TAG, "TCP RTP data received: $length bytes")
+//                                        Log.d(TAG, "TCP RTP data received: $length bytes")
                                         withContext(Dispatchers.Main) {
                                             listener?.onRtpDataReceived(data, true)
                                         }
                                     } else if (channel == 1) { // RTCP channel
-                                        Log.d(TAG, "TCP RTCP data received: $length bytes")
+//                                        Log.d(TAG, "TCP RTCP data received: $length bytes")
                                         withContext(Dispatchers.Main) {
                                             listener?.onRtpDataReceived(data, false)
                                         }

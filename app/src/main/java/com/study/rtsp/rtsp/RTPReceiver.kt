@@ -202,7 +202,10 @@ class RTPReceiver(
                     lastCleanupTime = currentTime
                 }
 
-                // UDP 패킷 수신
+                /**
+                 * UDP 패킷 수신한다.
+                 * UDP 패킷을 수신하면 UDP 헤더도 같이 들어오는데 자동으로 짤라서 RTP 패킷만 담겨있다.
+                 * **/
                 udpSocket?.receive(packet)
 
                 consecutiveTimeouts = 0 // 패킷 수신 시 카운터 리셋
@@ -232,7 +235,7 @@ class RTPReceiver(
     fun processTcpRtpData(data: ByteArray) {
         scope.launch {
             try {
-                Log.d(TAG, "Processing TCP RTP data: ${data.size} bytes")
+//                Log.d(TAG, "Processing TCP RTP data: ${data.size} bytes")
                 isTcpMode = true
                 bytesReceived += data.size
                 processRTPPacket(data, data.size)
@@ -242,6 +245,9 @@ class RTPReceiver(
         }
     }
 
+    /**
+     * @param data : RTP 패킷
+     * **/
     private suspend fun processRTPPacket(data: ByteArray, length: Int) {
         if (length < RTP_HEADER_SIZE) {
             Log.w(TAG, "Packet too short: $length bytes")
@@ -266,7 +272,7 @@ class RTPReceiver(
             when (sequenceResult) {
                 SequenceResult.VALID -> {
                     packetsReceived++
-                    Log.d(TAG, "Valid RTP packet #$packetsReceived, seq=${rtpHeader.sequenceNumber}, timestamp=${rtpHeader.timestamp}")
+//                    Log.d(TAG, "Valid RTP packet #$packetsReceived, seq=${rtpHeader.sequenceNumber}, timestamp=${rtpHeader.timestamp}")
                 }
                 SequenceResult.DUPLICATE -> {
                     duplicatePackets++
@@ -351,6 +357,7 @@ class RTPReceiver(
         VALID, DUPLICATE, OUT_OF_ORDER, LOST
     }
 
+    /** 시퀀스 검증 **/
     private fun checkSequenceImproved(sequenceNumber: Int): SequenceResult {
         if (expectedSequence == -1) {
             // 첫 번째 패킷
@@ -397,6 +404,13 @@ class RTPReceiver(
         }
     }
 
+    /** 지터 계산
+     * 지터는 네트워크에서 패킷들이 도착하는 시간의 불규칙성
+     * 즉, 패킷 간 도착 시간의 변동
+     *
+     * 일정한 간격으로 도착하지 않고 들쑥날쑥할 때 발생하는 시간 변동 계산한다.
+     * 지터가 크면 영상이 끊기거나 재생이 불안정하다. 지터가 적어야한다.
+     * **/
     private fun calculateJitter(rtpTimestamp: Long) {
         val currentTime = System.currentTimeMillis()
 
@@ -422,7 +436,7 @@ class RTPReceiver(
         val nalHeader = payload[0].toInt() and 0xFF
         val nalType = nalHeader and 0x1F
 
-        Log.d(TAG, "Processing H.264 payload, NAL type: $nalType, size: ${payload.size}")
+//        Log.d(TAG, "Processing H.264 payload, NAL type: $nalType, size: ${payload.size}")
 
         when (nalType) {
             NAL_TYPE_SPS -> {
@@ -466,7 +480,25 @@ class RTPReceiver(
         }
     }
 
-    // 개선된 FU-A 처리
+    /**
+     * FU-A는 영상 프레임이 담겨있다.
+     *
+     * 꼭 한 패킷에 FU-A가 한 프레임이 아니라
+     *
+     * 한 프레임이여도 이미지 크기가 크면 3패킷으로 나눠서 들어올 수 있다.
+     *
+     * 첫 번째 패킷에는 FU-A가 (S=1, E=0) + 영상 데이터 조각. FU 인디케이터(1바이트)와 FU 헤더(1바이트, S 비트 포함)를 포함하며, 데이터는 프레임의 첫 부분.
+     * 두 번째 패킷에는 FU-A가 (S=0, E=0) + 영상 데이터 조각. FU 인디케이터와 FU 헤더가 여전히 포함되지만, 헤더 이후는 순수 영상 데이터 조각.
+     * 세 번째 패킷에는 FU-A가 (S=0, E=1) + 영상 데이터 조각. FU 헤더에 E 비트가 설정되어 프레임의 끝임을 표시.
+     *
+     * 이런 식으로 3패킷으로 들어올 수 있다.
+     *
+     * FU-A에 S로 들어오면 한 프레임의 시작인거고
+     * FU-A에 E로 들어오면 한 프레임의 끝인거다.
+     *
+     * 그래서 S와 E사이에 있는 이미지들을 하나로 합치면 하나의 프레임이 된다.
+     *
+     * **/
     private suspend fun processFUAImproved(payload: ByteArray, timestamp: Long) {
         if (payload.size < 2) {
             Log.w(TAG, "FU-A payload too short")
@@ -480,7 +512,7 @@ class RTPReceiver(
         val end = (fuHeader and 0x40) != 0    // E bit
         val nalType = fuHeader and 0x1F
 
-        Log.d(TAG, "FU-A: start=$start, end=$end, nalType=$nalType, size=${payload.size}")
+//        Log.d(TAG, "FU-A: start=$start, end=$end, nalType=$nalType, size=${payload.size}")
 
         // 새로운 타임스탬프면 기존 프래그먼트 폐기
         if (currentFragmentTimestamp != -1L && currentFragmentTimestamp != timestamp) {
@@ -538,7 +570,7 @@ class RTPReceiver(
                 offset += fragment.size
             }
 
-            Log.d(TAG, "FU-A reassembly complete, total size: $totalSize")
+//            Log.d(TAG, "FU-A reassembly complete, total size: $totalSize")
 
             // 완성된 NAL 유닛 처리
             val nalType = completeNAL[0].toInt() and 0x1F
